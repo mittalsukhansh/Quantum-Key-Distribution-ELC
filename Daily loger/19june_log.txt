@@ -1,0 +1,3 @@
+Both Rx and Tx are made and well established.
+
+Any signal sent from Tx is being recieved at Rx though the bit rate for now is 500 meaning pretty slow atp. - as of 19 june 26
