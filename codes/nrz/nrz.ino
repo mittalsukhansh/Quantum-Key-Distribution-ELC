@@ -1,3 +1,5 @@
+// transmitter nrz
+
 int ledPin = 13;
 int bitTime = 200;
 
