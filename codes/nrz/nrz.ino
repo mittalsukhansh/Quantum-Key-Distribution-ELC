@@ -1,7 +1,7 @@
 // transmitter nrz
 
 int ledPin = 13;
-int bitTime = 200;
+int bitTime = 500;
 
 void setup() {
   pinMode(ledPin, OUTPUT);
