@@ -1,3 +1,7 @@
-Both Rx and Tx are made and well established.
+Both Rx and Tx are made and well-established.
+Any signal sent from Tx is being received at Rx, though the bit rate for now is 500, meaning pretty slow at the moment. -> As of 19 June, 2026
 
-Any signal sent from Tx is being recieved at Rx though the bit rate for now is 500 meaning pretty slow atp. - as of 19 june 26
+Based on our testing, we are facing issues in exactly mapping threshold values whilst testing with different resistances.
+We've overcome our issue with bit transmission. Now we're adding a preamble of 8 bits (11110001) for further testing using the NRZ + Preamble combo.
+Preamble logic is working. Working on NRZ+ Length+ Preamble logic.
+Working on increasing data rate, whilst maintaining accuracy.             -> As of 20th June, 2026
