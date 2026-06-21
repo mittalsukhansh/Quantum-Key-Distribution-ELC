@@ -1,0 +1,204 @@
+#include <Arduino.h>
+#include <string.h>
+
+#define RX_PIN 34
+#define THRESHOLD 3900
+
+// HALF-bit duration (ms) - matches TX's bitTime meaning exactly.
+// One full Manchester data bit = 2 * bitTime.
+int bitTime = 100;   // Must match TX
+
+// IEEE 802.3 convention (mainstream/Ethernet standard):
+//   bit '0' -> HIGH then LOW   (falling edge mid-bit)
+//   bit '1' -> LOW  then HIGH  (rising edge mid-bit)
+// analogRead < THRESHOLD == optical "HIGH" (light on).
+
+// Oversampling per HALF-bit: take several quick samples within each half
+// window and majority-vote the level. Filters brief ambient flicker the
+// same way the NRZ RX's full-bit oversampling did.
+const int SAMPLES_PER_HALF_BIT = 3;        // must divide cleanly into bitTime
+const int SUB_SAMPLE_DELAY = bitTime / SAMPLES_PER_HALF_BIT;
+
+// --- Idle detection ---
+// If we see this many consecutive '?' (no-transition) reads while
+// SCANNING, we're between frames, not mid-frame. We deliberately wait
+// out the idle gap before resuming bit-by-bit sampling, so we don't
+// try to decode silence as bits (this was the bug: the old RX kept
+// sampling fixed windows through dead time and locked onto noise).
+const int IDLE_CONFIRM_COUNT = 4;   // consecutive '?' reads to confirm idle
+int consecutiveUnknown = 0;
+
+// --- Preamble config ---
+#define PREAMBLE "11110001"
+const int preambleLen = sizeof(PREAMBLE) - 1;
+char bitWindow[preambleLen + 1];
+
+// Number of bits used to encode the payload length.
+// MUST match LENGTH_BITS on the transmitter.
+const int LENGTH_BITS = 8;
+
+// --- Receiver state machine ---
+enum RxState { SCANNING, READING_LENGTH, READING_DATA };
+RxState state = SCANNING;
+
+int lengthBitsCollected = 0;
+int dataLenValue = 0;
+
+int dataBitsCollected = 0;
+char dataBuf[256];
+
+void resetToScanning() {
+  state = SCANNING;
+  memset(bitWindow, '0', preambleLen);
+  bitWindow[preambleLen] = '\0';
+  lengthBitsCollected = 0;
+  dataLenValue = 0;
+  dataBitsCollected = 0;
+  consecutiveUnknown = 0;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);  // let the USB-serial bridge settle after upload/reset
+  Serial.println("Manchester RX Started");
+  resetToScanning();
+}
+
+// Take SAMPLES_PER_HALF_BIT readings spread across one half-bit period
+// and return the majority-vote level: '1' for optical-HIGH (light on),
+// '0' for optical-LOW.
+char sampleLevelMajorityVote() {
+  int highCount = 0;
+  for (int i = 0; i < SAMPLES_PER_HALF_BIT; i++) {
+    int adc = analogRead(RX_PIN);
+    if (adc < THRESHOLD) highCount++;
+    delay(SUB_SAMPLE_DELAY);
+  }
+  return (highCount > SAMPLES_PER_HALF_BIT / 2) ? '1' : '0';
+}
+
+// Read one full Manchester-coded bit (IEEE 802.3):
+//   HIGH->LOW = '0', LOW->HIGH = '1'
+// Returns '?' if no transition was seen - this happens both on a
+// genuinely corrupted bit AND on an idle line (no frame being sent),
+// so the caller distinguishes those cases using consecutiveUnknown.
+char readManchesterBit() {
+  char firstHalf = sampleLevelMajorityVote();
+  char secondHalf = sampleLevelMajorityVote();
+
+  if (firstHalf == '1' && secondHalf == '0') return '0';  // HIGH->LOW
+  if (firstHalf == '0' && secondHalf == '1') return '1';  // LOW->HIGH
+  return '?';
+}
+
+void processBit(char bit) {
+  switch (state) {
+
+    case SCANNING: {
+      for (int i = 0; i < preambleLen - 1; i++) {
+        bitWindow[i] = bitWindow[i + 1];
+      }
+      bitWindow[preambleLen - 1] = bit;
+
+      Serial.print("Scanning: ");
+      Serial.println(bitWindow);
+
+      if (strcmp(bitWindow, PREAMBLE) == 0) {
+        Serial.println(">>> PREAMBLE DETECTED, SYNCED <<<");
+        state = READING_LENGTH;
+        lengthBitsCollected = 0;
+        dataLenValue = 0;
+      }
+      break;
+    }
+
+    case READING_LENGTH: {
+      dataLenValue = (dataLenValue << 1) | (bit - '0');
+      lengthBitsCollected++;
+
+      if (lengthBitsCollected >= LENGTH_BITS) {
+        Serial.print(">>> LENGTH = ");
+        Serial.print(dataLenValue);
+        Serial.println(" bits");
+
+        if (dataLenValue == 0) {
+          Serial.println(">>> FRAME COMPLETE (empty payload) <<<");
+          resetToScanning();
+        } else if (dataLenValue > (int)sizeof(dataBuf) - 1) {
+          Serial.println("ERROR: length exceeds buffer, resetting");
+          resetToScanning();
+        } else {
+          state = READING_DATA;
+          dataBitsCollected = 0;
+        }
+      }
+      break;
+    }
+
+    case READING_DATA: {
+      dataBuf[dataBitsCollected] = bit;
+      dataBitsCollected++;
+      Serial.println(bit);
+
+      if (dataBitsCollected >= dataLenValue) {
+        dataBuf[dataBitsCollected] = '\0';
+        Serial.print(">>> FRAME COMPLETE, payload = ");
+        Serial.println(dataBuf);
+        resetToScanning();
+      }
+      break;
+    }
+  }
+}
+
+// While idle, sample once per half-bit window and just watch for the
+// first transition - that marks the start of a new frame's first bit.
+// This loop is what's missing from a naive port of the NRZ RX: it
+// gives the RX an explicit "nothing is happening" state instead of
+// always assuming a bit is currently being transmitted.
+void waitForIdleToEnd() {
+  unsigned long lastHeartbeat = millis();
+
+  while (true) {
+    char level1 = sampleLevelMajorityVote();
+    char level2 = sampleLevelMajorityVote();
+
+    if (level1 != level2) {
+      char bit = (level1 == '1' && level2 == '0') ? '0' :
+                 (level1 == '0' && level2 == '1') ? '1' : '?';
+      if (bit != '?') {
+        consecutiveUnknown = 0;
+        processBit(bit);
+        return;
+      }
+    }
+    // else: flat level, still idle - keep waiting
+
+    // Heartbeat so idle vs. hung is never ambiguous on the monitor.
+    if (millis() - lastHeartbeat >= 2000) {
+      Serial.print("idle, line level = ");
+      Serial.println(level1);
+      lastHeartbeat = millis();
+    }
+  }
+}
+
+void loop() {
+
+  char bit = readManchesterBit();
+
+  if (bit == '?') {
+    consecutiveUnknown++;
+    if (consecutiveUnknown >= IDLE_CONFIRM_COUNT) {
+      if (state != SCANNING) {
+        Serial.println("WARN: lost sync mid-frame, resyncing");
+      }
+      resetToScanning();
+      waitForIdleToEnd();
+    }
+    return;
+  }
+
+  consecutiveUnknown = 0;
+  processBit(bit);
+}
