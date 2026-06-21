@@ -1,0 +1,117 @@
+// ============================================================
+// Manchester Transmitter (IEEE 802.3 convention - mainstream/Ethernet)
+//
+// 0 = HIGH -> LOW   (falling edge mid-bit)
+// 1 = LOW  -> HIGH  (rising edge mid-bit)
+//
+// Frame Format:
+// [PREAMBLE][LENGTH][PAYLOAD]
+//
+// PREAMBLE = 11110001
+// LENGTH   = 8-bit payload length
+// PAYLOAD  = User data
+// ============================================================
+
+int ledPin = 13;
+
+// HALF-BIT duration (ms). One Manchester bit = 2 * bitTime.
+int bitTime = 100;
+
+String PREAMBLE = "11110001";
+
+// Number of bits used for payload length
+const int LENGTH_BITS = 8;
+
+// How long the line stays LOW (idle) between frames.
+// Must be long enough for the RX to recognize "no transitions happening"
+// as idle rather than as more bits. A few bit periods is plenty.
+const int IDLE_GAP_MS = bitTime * 6;
+
+void setup() {
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);   // line starts idle LOW
+  Serial.begin(9600);
+  Serial.println("================================");
+  Serial.println("IEEE 802.3 Manchester TX");
+  Serial.println("Enter binary string:");
+  Serial.println("================================");
+}
+
+// ------------------------------------------------------------
+// IEEE 802.3 Manchester Encoding
+// 0 = HIGH -> LOW
+// 1 = LOW  -> HIGH
+// ------------------------------------------------------------
+void sendManchesterBit(char bit) {
+  if (bit == '0') {
+    digitalWrite(ledPin, HIGH);
+    delay(bitTime);
+    digitalWrite(ledPin, LOW);
+    delay(bitTime);
+  } else if (bit == '1') {
+    digitalWrite(ledPin, LOW);
+    delay(bitTime);
+    digitalWrite(ledPin, HIGH);
+    delay(bitTime);
+  }
+}
+
+// ------------------------------------------------------------
+// Convert integer to fixed-width binary string
+// ------------------------------------------------------------
+String toBinaryString(int value, int width) {
+  String out = "";
+  for (int i = width - 1; i >= 0; i--) {
+    out += ((value >> i) & 1) ? '1' : '0';
+  }
+  return out;
+}
+
+void loop() {
+  if (Serial.available()) {
+    String data = Serial.readStringUntil('\n');
+
+    // Keep only valid binary characters
+    String cleanData = "";
+    for (int i = 0; i < data.length(); i++) {
+      if (data[i] == '0' || data[i] == '1') {
+        cleanData += data[i];
+      }
+    }
+
+    int payloadLength = cleanData.length();
+    if (payloadLength > 255) {
+      Serial.println("ERROR: Payload too long.");
+      payloadLength = 255;
+      cleanData = cleanData.substring(0, payloadLength);
+    }
+
+    String lengthField = toBinaryString(payloadLength, LENGTH_BITS);
+    String frame = PREAMBLE + lengthField + cleanData;
+
+    Serial.println();
+    Serial.println("========== FRAME ==========");
+    Serial.print("Preamble : "); Serial.println(PREAMBLE);
+    Serial.print("Length   : "); Serial.print(lengthField);
+    Serial.print(" ("); Serial.print(payloadLength); Serial.println(" bits)");
+    Serial.print("Payload  : "); Serial.println(cleanData);
+    Serial.print("Frame    : "); Serial.println(frame);
+    Serial.println("===========================");
+
+    // Ensure line is idle LOW before starting - guarantees the first
+    // bit's transition is unambiguous to the RX.
+    digitalWrite(ledPin, LOW);
+    delay(IDLE_GAP_MS);
+
+    for (int i = 0; i < frame.length(); i++) {
+      sendManchesterBit(frame[i]);
+    }
+
+    // Return to idle LOW and hold it - this gap is what lets the RX
+    // detect "frame ended" instead of trying to decode the silence
+    // as more bits.
+    digitalWrite(ledPin, LOW);
+    Serial.println("Transmission Complete");
+    Serial.println();
+  }
+}
