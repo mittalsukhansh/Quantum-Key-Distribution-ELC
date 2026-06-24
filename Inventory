@@ -1,6 +1,6 @@
 2 X polariser
 1 X Arduino uno
-2 X 618297
+1 X 618297 mini breadboard
 1 X breadboard
 jumper wires
 1 X bpw32 photodiode
@@ -8,12 +8,17 @@ jumper wires
 1 X 650 nm laser
 1 X cable
 1 X connecting wire
-1 X small laser
+2 X small laser
 2 X ULN2003 stepper motor driver board
 1 X led
-1X potentiometer
-1 X ir reciever module
-3 X resistor
+1 X potentiometer
+1 X ir reciever module 
+4 X resistor
 1 X esp32
 1 X esp32 expansion board
 1 X transistor
+1 X vernier calliper
+1 X screw gauge 
+2 X LM358 op amp ic
+1 X wire clipper 
+1 X multimeter 
