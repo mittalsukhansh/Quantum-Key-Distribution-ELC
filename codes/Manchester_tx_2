@@ -1,0 +1,98 @@
+#include <Arduino.h>
+
+#define TX_PIN 13
+
+// Half-bit duration (ms)
+// 500 means:
+// HIGH 500 ms + LOW 500 ms = 1 Manchester bit = 1000 ms
+const uint16_t HALF_BIT_TIME = 50;
+
+//--------------------------------------------------
+// Send one Manchester bit (IEEE 802.3)
+// 0 = HIGH -> LOW
+// 1 = LOW  -> HIGH
+//--------------------------------------------------
+void sendManchesterBit(char bit)
+{
+    if (bit == '0')
+    {
+        digitalWrite(TX_PIN, HIGH);
+        delay(HALF_BIT_TIME);
+
+        digitalWrite(TX_PIN, LOW);
+        delay(HALF_BIT_TIME);
+    }
+    else if (bit == '1')
+    {
+        digitalWrite(TX_PIN, LOW);
+        delay(HALF_BIT_TIME);
+
+        digitalWrite(TX_PIN, HIGH);
+        delay(HALF_BIT_TIME);
+    }
+}
+
+//--------------------------------------------------
+// Send payload only
+//--------------------------------------------------
+void sendPayload(const String &payload)
+{
+    // Idle LOW before transmission
+    digitalWrite(TX_PIN, LOW);
+    delay(HALF_BIT_TIME * 6);
+
+    Serial.print("Sending: ");
+    Serial.println(payload);
+
+    for (int i = 0; i < payload.length(); i++)
+    {
+        sendManchesterBit(payload[i]);
+    }
+
+    // Return to idle LOW
+    digitalWrite(TX_PIN, LOW);
+
+    Serial.println("Transmission Complete");
+    Serial.println();
+}
+
+void setup()
+{
+    pinMode(TX_PIN, OUTPUT);
+    digitalWrite(TX_PIN, LOW);
+
+    Serial.begin(115200);
+
+    Serial.println("================================");
+    Serial.println("Manchester Transmitter");
+    Serial.println("Payload Only");
+    Serial.println("================================");
+    Serial.println("Enter binary string:");
+}
+
+void loop()
+{
+    if (Serial.available())
+    {
+        String input = Serial.readStringUntil('\n');
+        String payload = "";
+
+        // Keep only binary characters
+        for (int i = 0; i < input.length(); i++)
+        {
+            if (input[i] == '0' || input[i] == '1')
+            {
+                payload += input[i];
+            }
+        }
+
+        if (payload.length() > 0)
+        {
+            sendPayload(payload);
+        }
+        else
+        {
+            Serial.println("No valid binary data entered.");
+        }
+    }
+}
