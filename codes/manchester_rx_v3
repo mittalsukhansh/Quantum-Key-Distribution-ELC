@@ -1,0 +1,121 @@
+#include <Arduino.h>
+
+#define RX_PIN 34
+#define THRESHOLD 1000
+
+int bitTime = 50;   // Must match TX
+
+const int SAMPLES_PER_HALF_BIT = 3;                          // must divide cleanly into bitTime/2
+const int SUB_SAMPLE_DELAY = (bitTime / 2) / SAMPLES_PER_HALF_BIT;
+
+const int IDLE_CONFIRM_COUNT = 4;   // consecutive '?' reads to confirm idle
+int consecutiveUnknown = 0;
+
+uint8_t currentByte = 0;
+int bitsInByte = 0;
+
+void resetByteAlign() {
+  currentByte = 0;
+  bitsInByte = 0;
+  consecutiveUnknown = 0;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);  // let the USB-serial bridge settle after upload/reset
+  Serial.println("Manchester RX Started");
+  resetByteAlign();
+}
+
+const unsigned long HALF_BIT_US = (unsigned long)bitTime * 1000UL / 2;
+const unsigned long SAMPLE_INTERVAL_US = HALF_BIT_US / SAMPLES_PER_HALF_BIT;
+
+char sampleLevelMajorityVote() {
+  int highCount = 0;
+  unsigned long t0 = micros();
+
+  for (int i = 0; i < SAMPLES_PER_HALF_BIT; i++) {
+    unsigned long target = t0 + (unsigned long)i * SAMPLE_INTERVAL_US;
+    while ((long)(micros() - target) < 0) { /* busy-wait */ }
+    int adc = analogRead(RX_PIN);
+    if (adc < THRESHOLD) highCount++;
+  }
+
+  // pad out to exactly one half-bit period so the NEXT call starts on time
+  while ((long)(micros() - t0) < (long)HALF_BIT_US) { /* busy-wait */ }
+
+  return (highCount > SAMPLES_PER_HALF_BIT / 2) ? '1' : '0';
+}
+
+char readManchesterBit() {
+  char firstHalf = sampleLevelMajorityVote();
+  char secondHalf = sampleLevelMajorityVote();
+
+  if (firstHalf == '1' && secondHalf == '0') return '0';  // HIGH->LOW
+  if (firstHalf == '0' && secondHalf == '1') return '1';  // LOW->HIGH
+  return '?';
+}
+
+void processBit(char bit) {
+  Serial.print(bit);
+
+  currentByte = (currentByte << 1) | (bit - '0');
+  bitsInByte++;
+
+  if (bitsInByte >= 8) {
+    Serial.print("  -> byte: 0x");
+    Serial.print(currentByte, HEX);
+    if (isPrintable(currentByte)) {
+      Serial.print(" ('");
+      Serial.print((char)currentByte);
+      Serial.print("')");
+    }
+    Serial.println();
+    currentByte = 0;
+    bitsInByte = 0;
+  } else {
+    Serial.println();
+  }
+}
+
+void waitForIdleToEnd() {
+  unsigned long lastHeartbeat = millis();
+
+  while (true) {
+    char level1 = sampleLevelMajorityVote();
+    char level2 = sampleLevelMajorityVote();
+
+    if (level1 != level2) {
+      char bit = (level1 == '1' && level2 == '0') ? '0' :
+                 (level1 == '0' && level2 == '1') ? '1' : '?';
+      if (bit != '?') {
+        consecutiveUnknown = 0;
+        processBit(bit);
+        return;
+      }
+    }
+
+    if (millis() - lastHeartbeat >= 2000) {
+      Serial.print("idle, line level = ");
+      Serial.println(level1);
+      lastHeartbeat = millis();
+    }
+  }
+}
+
+void loop() {
+
+  char bit = readManchesterBit();
+
+  if (bit == '?') {
+    consecutiveUnknown++;
+    if (consecutiveUnknown >= IDLE_CONFIRM_COUNT) {
+      resetByteAlign();
+      waitForIdleToEnd();
+    }
+    return;
+  }
+
+  consecutiveUnknown = 0;
+  processBit(bit);
+}
