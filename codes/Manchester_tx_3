@@ -1,0 +1,110 @@
+#include <Arduino.h>
+
+#define TX_PIN 13
+
+// Half-bit duration (ms)
+// 50 means: HIGH 50ms + LOW 50ms = 1 Manchester bit = 100ms
+const uint16_t HALF_BIT_TIME = 25;
+
+//--------------------------------------------------
+// Convert a string of characters into a binary string
+// Each character -> 8-bit ASCII binary
+//--------------------------------------------------
+String textToBinary(const String &text)
+{
+    String binary = "";
+    for (int i = 0; i < text.length(); i++)
+    {
+        byte b = (byte)text[i];
+        for (int bitPos = 7; bitPos >= 0; bitPos--)
+        {
+            binary += ((b >> bitPos) & 0x01) ? '1' : '0';
+        }
+    }
+    return binary;
+}
+
+//--------------------------------------------------
+// Send one Manchester bit (IEEE 802.3)
+// 0 = HIGH -> LOW
+// 1 = LOW  -> HIGH
+//--------------------------------------------------
+void sendManchesterBit(char bit)
+{
+    if (bit == '0')
+    {
+        digitalWrite(TX_PIN, HIGH);
+        delay(HALF_BIT_TIME);
+        digitalWrite(TX_PIN, LOW);
+        delay(HALF_BIT_TIME);
+    }
+    else if (bit == '1')
+    {
+        digitalWrite(TX_PIN, LOW);
+        delay(HALF_BIT_TIME);
+        digitalWrite(TX_PIN, HIGH);
+        delay(HALF_BIT_TIME);
+    }
+}
+
+//--------------------------------------------------
+// Send payload only (binary string)
+//--------------------------------------------------
+void sendPayload(const String &payload)
+{
+    // Idle LOW before transmission
+    digitalWrite(TX_PIN, LOW);
+    delay(HALF_BIT_TIME * 6);
+
+    Serial.print("Sending binary: ");
+    Serial.println(payload);
+
+    for (int i = 0; i < payload.length(); i++)
+    {
+        sendManchesterBit(payload[i]);
+    }
+
+    // Return to idle LOW
+    digitalWrite(TX_PIN, LOW);
+    Serial.println("Transmission Complete");
+    Serial.println();
+}
+
+void setup()
+{
+    pinMode(TX_PIN, OUTPUT);
+    digitalWrite(TX_PIN, LOW);
+    Serial.begin(115200);
+    Serial.println("================================");
+    Serial.println("Manchester Transmitter");
+    Serial.println("ASCII Text -> Binary -> Manchester");
+    Serial.println("================================");
+    Serial.println("Enter any text (letters, spaces, symbols):");
+}
+
+void loop()
+{
+    if (Serial.available())
+    {
+        String input = Serial.readStringUntil('\n');
+        input.trim(); // remove trailing \r or whitespace from newline
+
+        if (input.length() > 0)
+        {
+            String payload = textToBinary(input);
+
+            Serial.print("Original text: ");
+            Serial.println(input);
+            Serial.print("Character count: ");
+            Serial.println(input.length());
+            Serial.print("Bit count: ");
+            Serial.println(payload.length());
+
+            sendPayload(payload);
+        }
+        else
+        {
+            Serial.println("No data entered.");
+        }
+    }
+}
