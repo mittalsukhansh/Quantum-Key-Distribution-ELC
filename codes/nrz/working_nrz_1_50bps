@@ -1,0 +1,213 @@
+// =============================================================================
+//  VLC Transmitter — Arduino (NRZ, micros()-timed)
+//  Hardware : LED on LED_PIN (default pin 13), Active HIGH (LED ON = logic 1)
+//
+//  Frame format (transmitted MSB-first, one bit per BIT_PERIOD_US):
+//    [PREAMBLE × 2]  2 × 0xAA  (alternating 10101010 — gives RX a clock ref)
+//    [SYNC WORD]     0x7E      (unique delimiter, ends preamble phase)
+//    [LENGTH]        1 byte    (number of payload bytes, 1–MAX_PAYLOAD)
+//    [PAYLOAD]       LENGTH bytes (raw ASCII / binary)
+//    [CHECKSUM]      1 byte    (XOR of all payload bytes)
+//    [TAIL]          0x00      (all-LOW idle guard, lets RX fully clock out)
+//
+//  Usage:
+//    Open Serial monitor at 115200. Type any text and press Enter.
+//    The Arduino will frame it and send it over the LED.
+//    Binary input: prefix with 0x, e.g.  0xDE 0xAD
+// =============================================================================
+
+#include <Arduino.h>
+
+// ── Pin / hardware ────────────────────────────────────────────────────────────
+#define LED_PIN       13      // Change if needed; must be a digital output
+#define LED_ON        HIGH    // Active-HIGH: LED ON = logic 1
+#define LED_OFF       LOW
+
+// ── Timing ──────────────────────────────────────────────────────────────────────────────
+// 20 ms / bit = 50 bps.  Deliberately slow to let the BPW34 load-resistor
+// RC (τ ≈25 ms) settle during LED-OFF bits.  RX samples at 15 ms into each
+// window (75%), where the OFF-state ADC has risen to ~45% of idle baseline.
+// To speed up: reduce the RX load resistor to lower τ, then decrease this.
+#define BIT_PERIOD_US 20000UL
+
+// ── Frame constants ───────────────────────────────────────────────────────────
+#define PREAMBLE_BYTE 0xAA    // alternating 10101010; 2 sent before sync
+#define SYNC_WORD     0x7E    // unique sync delimiter
+#define TAIL_BYTE     0x00    // idle / line-drain guard at end of frame
+#define MAX_PAYLOAD   64      // max bytes per frame (keep short for reliability)
+
+// ── Globals ───────────────────────────────────────────────────────────────────
+static char    inputBuf[MAX_PAYLOAD + 4]; // Serial line buffer
+static uint8_t inputLen = 0;
+
+// ── Low-level: send one bit ────────────────────────────────────────────────────
+// Uses micros() so bit timing is not affected by Serial or other short ISRs.
+static uint32_t lastBitStart = 0;
+
+void sendBit(bool value) {
+  // Wait until BIT_PERIOD_US has elapsed since the last bit started.
+  // On the very first bit we seed lastBitStart here so there's no extra gap.
+  if (lastBitStart == 0) {
+    lastBitStart = micros();
+  } else {
+    while ((micros() - lastBitStart) < BIT_PERIOD_US) { /* spin */ }
+    lastBitStart += BIT_PERIOD_US;  // maintain phase — don't re-read micros()
+  }
+  digitalWrite(LED_PIN, value ? LED_ON : LED_OFF);
+}
+
+// ── Send one byte, MSB first ──────────────────────────────────────────────────
+void sendByte(uint8_t b) {
+  for (int i = 7; i >= 0; i--) {
+    sendBit((b >> i) & 0x01);
+  }
+}
+
+// ── Transmit a full frame ─────────────────────────────────────────────────────
+void transmitFrame(const uint8_t *payload, uint8_t len) {
+  if (len == 0 || len > MAX_PAYLOAD) return;
+
+  // Build XOR checksum
+  uint8_t checksum = 0;
+  for (uint8_t i = 0; i < len; i++) checksum ^= payload[i];
+
+  // Reset bit-phase timer so first bit is clean
+  lastBitStart = 0;
+
+  // 1. Preamble (2 bytes of alternating pattern)
+  sendByte(PREAMBLE_BYTE);
+  sendByte(PREAMBLE_BYTE);
+
+  // 2. Sync word
+  sendByte(SYNC_WORD);
+
+  // 3. Length
+  sendByte(len);
+
+  // 4. Payload
+  for (uint8_t i = 0; i < len; i++) {
+    sendByte(payload[i]);
+  }
+
+  // 5. Checksum
+  sendByte(checksum);
+
+  // 6. Tail / idle guard (line goes LOW = LED OFF)
+  sendByte(TAIL_BYTE);
+  // Hold LED OFF for 4 extra bit periods — gives RX time to clock out its
+  // last sample window (up to 18 ms) and start calibration with a settled ADC.
+  delayMicroseconds(BIT_PERIOD_US * 4);
+  digitalWrite(LED_PIN, LED_OFF);
+
+  // ── Debug print AFTER frame is sent (no timing contamination) ──────────────
+  Serial.print(F("[TX] Sent frame: len="));
+  Serial.print(len);
+  Serial.print(F("  checksum=0x"));
+  Serial.print(checksum, HEX);
+  Serial.print(F("  payload=\""));
+  for (uint8_t i = 0; i < len; i++) {
+    if (payload[i] >= 0x20 && payload[i] < 0x7F) {
+      Serial.print((char)payload[i]);
+    } else {
+      Serial.print(F("\\x"));
+      if (payload[i] < 0x10) Serial.print('0');
+      Serial.print(payload[i], HEX);
+    }
+  }
+  Serial.println(F("\""));
+}
+
+// ── Parse binary tokens from input (0xHH or plain ASCII) ─────────────────────
+// Returns number of bytes written into out[]. Returns 0 on parse error.
+uint8_t parseInput(const char *line, uint8_t lineLen, uint8_t *out, uint8_t maxOut) {
+  uint8_t count = 0;
+  uint8_t i = 0;
+
+  // If no 0x tokens found, treat as raw ASCII string
+  bool hasBinary = false;
+  for (uint8_t k = 0; k + 1 < lineLen; k++) {
+    if (line[k] == '0' && (line[k+1] == 'x' || line[k+1] == 'X')) {
+      hasBinary = true;
+      break;
+    }
+  }
+
+  if (!hasBinary) {
+    // Plain ASCII: copy directly (strip trailing CR/LF)
+    while (i < lineLen && count < maxOut) {
+      char c = line[i++];
+      if (c == '\r' || c == '\n') break;
+      out[count++] = (uint8_t)c;
+    }
+    return count;
+  }
+
+  // Binary mode: parse space-separated 0xHH tokens
+  while (i < lineLen && count < maxOut) {
+    while (i < lineLen && line[i] == ' ') i++;  // skip spaces
+    if (i + 3 < lineLen && line[i] == '0' && (line[i+1] == 'x' || line[i+1] == 'X')) {
+      char hi = line[i+2];
+      char lo = line[i+3];
+      auto hexDigit = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+      };
+      int h = hexDigit(hi), l = hexDigit(lo);
+      if (h < 0 || l < 0) { i++; continue; }   // malformed token, skip
+      out[count++] = (uint8_t)((h << 4) | l);
+      i += 4;
+    } else {
+      i++;  // skip unrecognised character
+    }
+  }
+  return count;
+}
+
+// ── Arduino setup/loop ────────────────────────────────────────────────────────
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LED_OFF);
+
+  Serial.begin(115200);
+  while (!Serial) {}  // wait for USB serial on Leonardo/Micro; harmless on Uno
+
+  Serial.println(F("=============================================="));
+  Serial.println(F(" VLC Transmitter  —  NRZ  —  1000 bps"));
+  Serial.println(F("=============================================="));
+  Serial.println(F("Type text and press Enter to transmit."));
+  Serial.println(F("Binary: prefix bytes with 0x, e.g.  0xDE 0xAD"));
+  Serial.println(F("Max payload: 64 bytes per frame."));
+  Serial.println();
+}
+
+void loop() {
+  // Non-blocking Serial line reader
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n') {
+      // End of line — process what we've got
+      if (inputLen > 0) {
+        static uint8_t frameBuf[MAX_PAYLOAD];
+        uint8_t frameLen = parseInput(inputBuf, inputLen, frameBuf, MAX_PAYLOAD);
+
+        if (frameLen == 0) {
+          Serial.println(F("[TX] Nothing to send (empty or parse error)."));
+        } else {
+          transmitFrame(frameBuf, frameLen);
+        }
+      }
+      inputLen = 0;  // reset for next line
+    } else if (c != '\r') {
+      // Accumulate (ignore CR in case of \r\n line endings)
+      if (inputLen < sizeof(inputBuf) - 1) {
+        inputBuf[inputLen++] = c;
+      } else {
+        Serial.println(F("[TX] Input too long — truncated at 64 bytes."));
+      }
+    }
+  }
+  // LED stays OFF while idle (no signal)
+}
