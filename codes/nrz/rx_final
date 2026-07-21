@@ -1,0 +1,324 @@
+#include <Arduino.h>
+#include <string.h>
+
+  #define BPS_200
+
+#elif defined(BPS_200)
+  #define BIT_PERIOD_US      5000UL
+  #define SAMPLE_OFFSET_US   4000UL
+  #define SAMPLE_INTERVAL_US  200UL
+  #define SAMPLES_PER_BIT       5
+  #define H_HIGH_PCT           10
+  #define H_LOW_PCT            30
+  #define SPEED_LABEL "200 bps"
+
+#else
+  #error "Define exactly one speed: BPS_50 / BPS_200 / BPS_500 / BPS_1000"
+#endif
+
+#define RX_PIN  34
+
+static uint16_t H_HIGH = 200;
+static uint16_t H_LOW  = 800;
+
+#define PREAMBLE_BYTE  0xAA
+#define SYNC_WORD      0x7E
+#define MAX_PAYLOAD    64
+
+struct ByteDebug {
+  uint16_t adc[8][SAMPLES_PER_BIT];
+  uint8_t  votes1[8];
+  uint8_t  bit[8];
+  bool     late[8];
+};
+static ByteDebug dbg;
+
+#define MAX_FRAME_LOG 72   
+
+struct LogEntry {
+  uint8_t   byteVal;
+  ByteDebug debug;
+  char      label[6];
+};
+static LogEntry frameLog[MAX_FRAME_LOG];
+static uint8_t  frameLogCount = 0;
+
+void resetFrameLog() { frameLogCount = 0; }
+
+void logByte(uint8_t val, const ByteDebug &d, const char *lbl) {
+  if (frameLogCount >= MAX_FRAME_LOG) return;
+  frameLog[frameLogCount].byteVal = val;
+  frameLog[frameLogCount].debug   = d;
+  strncpy(frameLog[frameLogCount].label, lbl, 5);
+  frameLog[frameLogCount].label[5] = '\0';
+  frameLogCount++;
+}
+
+void flushFrameLog() {
+  if (frameLogCount == 0) return;
+  Serial.println(F("─── Frame byte log ───────────────────────────────────────"));
+  for (uint8_t i = 0; i < frameLogCount; i++) {
+    const LogEntry &e = frameLog[i];
+    Serial.print('['); Serial.print(e.label); Serial.print(F("] 0x"));
+    if (e.byteVal < 0x10) Serial.print('0');
+    Serial.print(e.byteVal, HEX);
+    Serial.print(F("  "));
+    for (uint8_t b = 0; b < 8; b++) {
+      Serial.print(e.debug.late[b] ? 'L' : ' ');
+      Serial.print(e.debug.bit[b]);
+      Serial.print('/');
+      Serial.print(e.debug.votes1[b]);
+      if (b < 7) Serial.print(' ');
+    }
+    Serial.println();
+    // ADC detail on one compact line per bit
+    for (uint8_t b = 0; b < 8; b++) {
+      Serial.print(F("     b")); Serial.print(7 - b);
+      Serial.print(F(" adc=["));
+      for (uint8_t s = 0; s < SAMPLES_PER_BIT; s++) {
+        Serial.print(e.debug.adc[b][s]);
+        if (s < SAMPLES_PER_BIT - 1) Serial.print(',');
+      }
+      Serial.println(']');
+    }
+  }
+  Serial.println(F("──────────────────────────────────────────────────────────"));
+  frameLogCount = 0;
+}
+
+// =============================================================================
+//  State machine
+// =============================================================================
+enum RxState { STATE_IDLE, STATE_PREAMBLE, STATE_SYNC, STATE_LENGTH,
+               STATE_DATA, STATE_CHECKSUM, STATE_TAIL };
+static RxState  rxState      = STATE_IDLE;
+static uint8_t  dataLen      = 0;
+static uint8_t  dataCount    = 0;
+static uint8_t  payload[MAX_PAYLOAD];
+static uint8_t  checksumCalc = 0;
+static bool     checksumOK   = false;
+static uint32_t lastEdgeTime = 0;
+static uint8_t  lastHardBit  = 0;
+
+// =============================================================================
+//  calibrateThreshold()
+// =============================================================================
+void calibrateThreshold() {
+  Serial.println(F("[CAL] Calibrating... (keep TX idle)"));
+  uint32_t sum = 0;
+  uint16_t minV = 4095, maxV = 0;
+  for (int i = 0; i < 64; i++) {
+    uint16_t v = (uint16_t)analogRead(RX_PIN);
+    sum += v; if (v < minV) minV = v; if (v > maxV) maxV = v;
+    delayMicroseconds(500);
+  }
+  uint16_t avg = (uint16_t)(sum / 64);
+  if (avg < 300) {
+    H_HIGH = 80; H_LOW = 300;
+    Serial.println(F("[CAL] WARN: low ambient — defaults."));
+  } else {
+    H_HIGH = (uint16_t)(avg * (uint32_t)H_HIGH_PCT / 100);
+    H_LOW  = (uint16_t)(avg * (uint32_t)H_LOW_PCT  / 100);
+  }
+  Serial.print(F("[CAL] avg=")); Serial.print(avg);
+  Serial.print(F(" H_HIGH="));  Serial.print(H_HIGH);
+  Serial.print(F(" H_LOW="));   Serial.println(H_LOW);
+}
+
+void resetToIdle(bool recalibrate) {
+  rxState = STATE_IDLE;
+  dataLen = dataCount = checksumCalc = 0;
+  checksumOK  = false;
+  lastEdgeTime = lastHardBit = 0;
+  memset(payload, 0, sizeof(payload));
+  resetFrameLog();
+  if (recalibrate) calibrateThreshold();
+
+uint32_t detectEdge(uint32_t timeoutUs) {
+  uint32_t start = micros();
+  while ((micros() - start) < timeoutUs) {
+    if ((uint16_t)analogRead(RX_PIN) < H_HIGH) return micros();
+    delayMicroseconds(20);
+  }
+  return 0;
+}
+uint8_t sampleBit(uint32_t windowStart, uint8_t bitIdx) {
+  uint8_t votes1 = 0, votes0 = 0;
+  dbg.late[bitIdx] = ((int32_t)(micros() - (windowStart + SAMPLE_OFFSET_US)) > 0);
+
+  for (uint8_t s = 0; s < SAMPLES_PER_BIT; s++) {
+    uint32_t sampleAt = windowStart + SAMPLE_OFFSET_US + (uint32_t)s * SAMPLE_INTERVAL_US;
+    while ((int32_t)(micros() - sampleAt) < 0) { /* spin */ }
+    uint16_t adc = (uint16_t)analogRead(RX_PIN);
+    dbg.adc[bitIdx][s] = adc;
+    uint8_t b;
+    if      (adc < H_HIGH) { b = 1; lastHardBit = 1; }
+    else if (adc > H_LOW)  { b = 0; lastHardBit = 0; }
+    else                   { b = lastHardBit; }     // dead-band: hold last
+    if (b) votes1++; else votes0++;
+  }
+  uint8_t result = (votes1 > votes0) ? 1 : 0;
+  dbg.votes1[bitIdx] = votes1;
+  dbg.bit[bitIdx]    = result;
+  return result;
+}
+
+uint8_t sampleByte(uint32_t windowStart) {
+  uint8_t b = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    b = (b << 1) | sampleBit(windowStart, i);
+    windowStart += BIT_PERIOD_US;
+  }
+  lastEdgeTime = windowStart;
+  return b;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {}
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  Serial.println(F("============================================="));
+  Serial.print(  F(" VLC RX  —  NRZ  —  " SPEED_LABEL "  —  ESP32"));
+  Serial.println();
+  Serial.println(F("============================================="));
+  calibrateThreshold();
+  resetToIdle(false);
+}
+
+void loop() {
+
+  if (rxState == STATE_IDLE) {
+    Serial.println(F("[IDLE] Waiting..."));
+    uint32_t edge = detectEdge(5000000UL);
+    if (edge == 0) {
+      Serial.println(F("[IDLE] Timeout — recalibrating."));
+      calibrateThreshold();
+      return;
+    }
+    Serial.println(F("[IDLE] Edge — hunting preamble."));
+    lastEdgeTime = edge;
+    rxState = STATE_PREAMBLE;
+    resetFrameLog();
+    return;
+  }
+
+  if (rxState == STATE_PREAMBLE) {
+
+    uint8_t pre1 = sampleByte(lastEdgeTime);
+    ByteDebug pre1dbg = dbg;               // save before overwritten by byte 2
+
+    if (pre1 != PREAMBLE_BYTE) {
+      // Error — can print freely (restarting)
+      logByte(pre1, pre1dbg, "PRE1");
+      Serial.print(F("[PRE] byte1=0x")); if (pre1 < 0x10) Serial.print('0');
+      Serial.print(pre1, HEX); Serial.println(F(" ✗ — restart"));
+      flushFrameLog();
+      resetToIdle(false);
+      return;
+    }
+
+
+    logByte(pre1, pre1dbg, "PRE1");
+    logByte(pre2, dbg,     "PRE2");
+
+    if (pre2 != PREAMBLE_BYTE) {
+      Serial.print(F("[PRE] byte2=0x")); if (pre2 < 0x10) Serial.print('0');
+      Serial.print(pre2, HEX); Serial.println(F(" ✗ — restart"));
+      flushFrameLog();
+      resetToIdle(false);
+      return;
+    }
+
+    // Both OK — NO PRINT (budget may be < 700 µs at 1 kbps)
+    rxState = STATE_SYNC;
+    return;
+  }
+
+  if (rxState == STATE_SYNC     || rxState == STATE_LENGTH   ||
+      rxState == STATE_DATA     || rxState == STATE_CHECKSUM ||
+      rxState == STATE_TAIL) {
+
+    uint8_t b = sampleByte(lastEdgeTime);
+
+    switch (rxState) {
+
+      case STATE_SYNC:
+        logByte(b, dbg, "SYNC");
+        if (b == SYNC_WORD) {
+          // NO PRINT — transition instantly for next byte
+          rxState = STATE_LENGTH;
+        } else {
+          Serial.print(F("[SYNC] bad=0x")); if (b < 0x10) Serial.print('0');
+          Serial.print(b, HEX); Serial.println(F(" ✗"));
+          flushFrameLog();
+          resetToIdle(true);
+        }
+        break;
+
+      case STATE_LENGTH:
+        logByte(b, dbg, "LEN");
+        dataLen = b; dataCount = 0; checksumCalc = 0;
+        if (dataLen == 0 || dataLen > MAX_PAYLOAD) {
+          Serial.print(F("[LEN] bad=")); Serial.println(dataLen);
+          flushFrameLog();
+          resetToIdle(true);
+        } else {
+          // NO PRINT — transition instantly
+          rxState = STATE_DATA;
+        }
+        break;
+
+      case STATE_DATA: {
+        payload[dataCount] = b;
+        checksumCalc ^= b;
+        dataCount++;
+        // Build label "D01"–"D64"
+        char lbl[5];
+        lbl[0] = 'D';
+        if (dataCount < 10) { lbl[1]='0'; lbl[2]='0'+dataCount; lbl[3]='\0'; }
+        else { lbl[1]='0'+dataCount/10; lbl[2]='0'+dataCount%10; lbl[3]='\0'; }
+        logByte(b, dbg, lbl);
+        // NO PRINT — transition instantly (or stay in DATA)
+        if (dataCount >= dataLen) rxState = STATE_CHECKSUM;
+        break;
+      }
+
+      case STATE_CHECKSUM:
+        logByte(b, dbg, "CSUM");
+        checksumOK = (b == checksumCalc);
+        // NO PRINT — transition instantly
+        rxState = STATE_TAIL;
+        break;
+
+      // Last byte of frame — now safe to print everything.
+      case STATE_TAIL:
+        logByte(b, dbg, "TAIL");
+
+        // Full ADC log (timing no longer critical)
+        flushFrameLog();
+
+        // Frame summary
+        Serial.println();
+        if (checksumOK) {
+          Serial.println(F("╔══════════════════════════════╗"));
+          Serial.print(  F("║ PAYLOAD » \""));
+          for (uint8_t i = 0; i < dataLen; i++) {
+            uint8_t c = payload[i];
+            if (c >= 0x20 && c < 0x7F) Serial.print((char)c);
+            else { Serial.print(F("\\x")); if (c < 0x10) Serial.print('0'); Serial.print(c, HEX); }
+          }
+          Serial.println(F("\""));
+          Serial.println(F("╚══════════════════════════════╝"));
+        } else {
+          Serial.print(F("[CSUM] FAIL: rx=0x")); if (b < 0x10) Serial.print('0'); Serial.print(b, HEX);
+          Serial.print(F(" calc=0x")); if (checksumCalc < 0x10) Serial.print('0'); Serial.println(checksumCalc, HEX);
+        }
+        Serial.println();
+        resetToIdle(true);
+        break;
+
+      default: break;
+    }
+  }
+}
